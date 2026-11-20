@@ -148,19 +148,44 @@ def forecast_trophy(
     # Detect if all rates are identical (flat history)
     rates_all_same = len(set(o["r"] for o in obs)) == 1
 
-    # ── If rates flat → use tier growth model ──────────────────────────────
+    # ── If rates flat → dilution-aware stale-page model ───────────────────
+    # Exophase refreshes counts on its own schedule: between refreshes every
+    # read is identical. The house's launch-night recording (RULES) showed the
+    # page unchanged at 638 players through 04:00Z and refreshed by 04:30Z at
+    # 3,868 players — a tracked-player dilution of 3,868/638 = 6.06 in the
+    # first ~4.7 hours, with every rate but the automatic 100% one dropping.
+    # So when the page is stale, the rates at the target reflect the NEXT
+    # refresh's (larger) tracked base: forecast the dilution, not growth.
     if rates_all_same:
-        # Apply tier-based growth factor to extrapolate from last_r
-        k = TIER_K.get(tier, DEFAULT_K)
-        # Simple logistic growth toward tier ceiling
-        # Ceiling estimates: platinum≈0.5%, gold≈2%, silver≈8%, bronze≈20%
-        # These are rough — the game design determines actual ceiling.
-        # Since we don't know the ceiling, model as small multiplicative growth.
-        # Growth rate is tier-dependent.
-        # For 90-min practice: tiny growth.  For 7-day final: moderate growth.
-        growth = 1.0 + k * (target_hours / 24.0) * 0.05  # gentle growth
-        proj_r = min(last_r * growth, 99.9)
-        return baseline_quantiles(proj_r, horizon_days)
+        # The automatic 100% trophy never dilutes (every tracked player has it)
+        if last_r >= 99.95:
+            return baseline_quantiles(100.0, horizon_days)
+
+        if last_players < 2000:
+            # Early/stale tracking: the next refresh brings the tracked base to
+            # launch-week scale (~6.06x per the house's published reading).
+            # Earners also keep accruing while the page is stale: bump by a
+            # modest launch-hour accrual, capped so long horizons stay sane.
+            horizon_hours = horizon_days * 24.0
+            bump = min(0.07 * horizon_hours, 0.60)
+            dilution = 3868.0 / 638.0
+            proj_r = last_r * (1.0 + bump) / dilution
+            # Honest hedge: the refresh might land late (rates stay) — widen.
+            spread = 0.30
+        else:
+            # Stale at launch-week scale: a further refresh dilutes by the
+            # (unknown) adoption since — hedge wide around a mild dilution.
+            proj_r = last_r / 1.8
+            spread = 1.1
+        median_l = logit(proj_r)
+        qs = []
+        for z in Z:
+            q_l = max(logit(0.01), min(logit(99.99), median_l + z * spread))
+            qs.append(r4(sigmoid(q_l)))
+        for i in range(1, 5):
+            if qs[i] < qs[i - 1]:
+                qs[i] = qs[i - 1]
+        return [r4(q) for q in qs]
 
     # ── Logit-linear fit on earned count ─────────────────────────────────
     a, b, res_std = fit_logit_growth(obs, target_hours)
